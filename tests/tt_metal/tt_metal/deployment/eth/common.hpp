@@ -1,0 +1,288 @@
+#ifndef _ETH_COMMON_HPP
+#define _ETH_COMMON_HPP
+
+#include "tt_metal/tt_metal/deployment/deployment_common.hpp"
+
+#include "tt_metal/test_utils/stimulus.hpp"
+#include "command_queue_fixture.hpp"
+#include "tt_metal/tt_metal/eth/eth_test_common.hpp"
+
+namespace tt::tt_metal {
+
+[[maybe_unused]]
+static inline void prepare_sender(
+    tt::tt_metal::IDevice* const send_device,
+    const CoreCoord& send_core,
+    struct l1_allocator* send_allocator,
+    uint32_t transfer_size,
+    uint32_t transfer_count,
+    uint32_t* send_delta_addr,
+    std::vector<uint32_t>& inputs,
+    DataMovementProcessor processor,
+    uint32_t num_bytes_per_send,
+    uint32_t recv_l1_address,
+    tt_metal::Program* send_program) {
+    /* ==================== */
+    *send_delta_addr = l1_alloc(send_allocator, sizeof(uint64_t));
+    uint32_t send_l1_address = l1_alloc(send_allocator, transfer_size);
+    tt::tt_metal::MetalContext::instance().get_cluster().write_core(
+        send_device->id(), send_device->ethernet_core_from_logical_core(send_core), inputs, send_l1_address);
+
+    auto send_eth_config = tt_metal::EthernetConfig{
+        .noc = tt_metal::NOC::NOC_0,
+        .processor = processor,
+        .compile_args =
+            {
+                num_bytes_per_send,
+                transfer_size,
+                transfer_count,
+                *send_delta_addr,
+                send_l1_address,
+                recv_l1_address,
+            },
+    };
+    eth_test_common::set_arch_specific_eth_config(send_eth_config);
+
+    auto send_kernel = tt_metal::CreateKernel(
+        *send_program,
+        "tests/tt_metal/tt_metal/deployment/kernels/eth_simple_send_kernel.cpp",
+        send_core,
+        send_eth_config);
+
+    tt_metal::SetRuntimeArgs(*send_program, send_kernel, send_core, {});
+}
+
+[[maybe_unused]]
+static inline void prepare_receiver(
+    tt::tt_metal::IDevice* const recv_device,
+    const CoreCoord& recv_core,
+    struct l1_allocator* recv_allocator,
+    uint32_t transfer_size,
+    uint32_t transfer_count,
+    std::vector<uint32_t>& inputs,
+    DataMovementProcessor processor,
+    uint32_t* recv_l1_address,
+    tt_metal::Program* recv_program) {
+    /* ==================== */
+    std::vector<uint32_t> all_zeros(inputs.size(), 0);
+
+    *recv_l1_address = l1_alloc(recv_allocator, transfer_size);
+    tt::tt_metal::MetalContext::instance().get_cluster().write_core(
+        recv_device->id(), recv_device->ethernet_core_from_logical_core(recv_core), all_zeros, *recv_l1_address);
+
+    auto recv_eth_config = tt_metal::EthernetConfig{
+        .noc = tt_metal::NOC::NOC_0,
+        .processor = processor,
+        .compile_args =
+            {
+                transfer_size,
+                transfer_count,
+            },
+    };
+    eth_test_common::set_arch_specific_eth_config(recv_eth_config);
+
+    auto recv_kernel = tt_metal::CreateKernel(
+        *recv_program,
+        "tests/tt_metal/tt_metal/deployment/kernels/eth_simple_recv_kernel.cpp",
+        recv_core,
+        recv_eth_config);
+
+    tt_metal::SetRuntimeArgs(*recv_program, recv_kernel, recv_core, {});
+}
+
+template <typename FIXTURE>
+[[maybe_unused]]
+static void wait_to_finish(
+    FIXTURE* fixture,
+    tt_metal::Program& send_program,
+    tt_metal::Program& recv_program,
+    const std::shared_ptr<distributed::MeshDevice>& send_mesh_device,
+    const std::shared_ptr<distributed::MeshDevice>& recv_mesh_device,
+    distributed::MeshCoordinateRange& device_range) {
+    /* ==================== */
+    bool same_device = send_mesh_device == recv_mesh_device;
+
+    distributed::MeshWorkload send_workload;
+    distributed::MeshWorkload recv_workload_;
+    distributed::MeshWorkload& recv_workload = same_device ? send_workload : recv_workload_;
+
+    send_workload.add_program(device_range, std::move(send_program));
+    if (!same_device) {
+        recv_workload.add_program(device_range, std::move(recv_program));
+    }
+
+    fixture->RunProgram(send_mesh_device, send_workload, true);
+    if (!same_device) {
+        fixture->RunProgram(recv_mesh_device, recv_workload, true);
+    }
+
+    fixture->FinishCommands(send_mesh_device);
+    if (!same_device) {
+        fixture->FinishCommands(recv_mesh_device);
+    }
+}
+
+[[maybe_unused]]
+static bool data_check(
+    tt::tt_metal::IDevice* const recv_device,
+    const CoreCoord& recv_core,
+    uint32_t recv_l1_address,
+    std::vector<uint32_t>& inputs) {
+    /* ==================== */
+    auto readback_vec = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+        recv_device->id(),
+        recv_device->ethernet_core_from_logical_core(recv_core),
+        recv_l1_address,
+        inputs.size() * sizeof(uint32_t));
+
+    bool pass = readback_vec == inputs;
+    if (!pass) {
+        for (int i = 0; i < inputs.size(); i++) {
+            if (inputs[i] != readback_vec[i]) {
+                log_critical(tt::LogTest, "      Mismatch at index: {}", i);
+            }
+        }
+        log_critical(tt::LogTest, "      Mismatch at Core: {}", recv_core);
+    }
+
+    return pass;
+}
+
+[[maybe_unused]]
+static bool bandwidth_check(
+    tt::tt_metal::IDevice* const send_device,
+    const CoreCoord& send_core,
+    uint32_t send_delta_addr,
+    uint64_t total_transferred,
+    double threshold) {
+    /* ==================== */
+    uint64_t delta = read_eth_l1_u64(send_device, send_core, send_delta_addr);
+    double deltas = delta / 1.35e9; /* Assuming fixed max frequency */
+    double bandwidth = 8 * total_transferred / 1e9 / deltas;
+    log_info(tt::LogTest, "      Bandwidth {:.3f} Gbps, {:.3f} ms", bandwidth, deltas * 1000);
+
+    bool pass = bandwidth >= threshold;
+    if (!pass) {
+        log_critical(tt::LogTest, "      Expected at least: {} Gbps, got {:.2f} Gbps", threshold, bandwidth);
+    }
+
+    return pass;
+}
+
+[[maybe_unused]]
+static bool data_dram_check(
+    tt::tt_metal::IDevice* const recv_device,
+    uint32_t dram_start_addr,
+    uint32_t dram_end_addr,
+    uint32_t dram_bank_id,
+    std::vector<uint32_t>& inputs) {
+    /* ==================== */
+    uint64_t total_transferred = dram_end_addr - dram_start_addr;
+    std::vector<uint32_t> outputs;
+
+    detail::ReadFromDeviceDRAMChannel(recv_device, dram_bank_id, dram_start_addr, total_transferred, outputs);
+    log_info(tt::LogTest, "      Read {} bytes", outputs.size() * sizeof(uint32_t));
+    TT_FATAL(inputs.size() == outputs.size(), "Input and output vector sizes must match");
+    bool pass = inputs == outputs;
+
+    if (!pass) {
+        uint64_t total_mismatches = 0;
+        for (long i = 0; i < inputs.size(); i++) {
+            if (inputs[i] != outputs[i]) {
+                if (!total_mismatches) {
+                    log_critical(
+                        tt::LogTest,
+                        "      Input and output data don't match starting at: {:x}",
+                        dram_start_addr + i * sizeof(uint32_t));
+                }
+                total_mismatches++;
+                // log_critical(tt::LogTest, "      Input and output data don't match at {:08x}: {:08x} {:08x}", i,
+                // inputs[i], outputs[i]);
+            }
+        }
+        log_critical(tt::LogTest, "      Total mismatches: {} words", total_mismatches);
+    }
+
+    return pass;
+}
+
+template <typename FIXTURE>
+[[maybe_unused]]
+static void tensix_zero_dram(
+    FIXTURE* fixture,
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    uint32_t dram_start_addr,
+    uint32_t dram_end_addr,
+    uint32_t dram_bank_id) {
+    /* ==================== */
+    TT_FATAL(dram_start_addr < dram_end_addr, "start addr must be less than end addr");
+    tt_metal::Program zero_program = tt_metal::Program();
+
+    auto* const device = mesh_device->get_devices()[0];
+    CoreCoord core_grid = device->compute_with_storage_grid_size();
+    uint32_t total_bytes = dram_end_addr - dram_start_addr;
+    uint32_t core_count = core_grid.x * core_grid.y;
+    uint64_t per_core_bytes = total_bytes / core_count;
+    per_core_bytes = ((per_core_bytes + 15) >> 4) << 4;
+    TT_FATAL((total_bytes % 16) == 0, "Total size must be divisible by 16");
+    TT_FATAL((per_core_bytes % 16) == 0, "Per core size must be divisible by 16");
+
+    uint32_t transfer_size = 160 * 1024;
+    struct l1_allocator alloc = new_erisc_allocator();
+    uint32_t buffer0 = l1_alloc(&alloc, transfer_size);
+
+    auto zero_coord = distributed::MeshCoordinate(0, 0);
+    auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
+    distributed::MeshWorkload workload;
+
+    // log_info(tt::LogTest, "      start {:8x}", dram_start_addr);
+    // log_info(tt::LogTest, "      end   {:8x}", dram_end_addr);
+    uint32_t kernel_id = 0;
+    for (uint32_t x = 0; x < core_grid.x; x++) {
+        for (uint32_t y = 0; y < core_grid.y; y++) {
+            CoreCoord core = CoreCoord(x, y);
+
+            uint32_t id = kernel_id++;
+            uint32_t start_addr = dram_start_addr + id * per_core_bytes;
+            uint32_t end_addr =
+                start_addr + per_core_bytes > dram_end_addr ? dram_end_addr : start_addr + per_core_bytes;
+
+            start_addr = (start_addr >> 4) << 4;
+            end_addr = ((end_addr + 15) >> 4) << 4;
+
+            // log_info(tt::LogTest, "      kernel {}, {}", id, core);
+            // log_info(tt::LogTest, "      start  {:8x}", start_addr);
+            // log_info(tt::LogTest, "      end    {:8x}", end_addr);
+            // log_info(tt::LogTest, "      size   {:8x}", end_addr - start_addr);
+            DataMovementConfig config = {
+                .compile_args =
+                    {
+                        dram_bank_id,
+                        buffer0,
+                        transfer_size,
+                    },
+            };
+            auto kernel = tt_metal::CreateKernel(
+                zero_program, "tests/tt_metal/tt_metal/deployment/kernels/zero_kernel.cpp", core, config);
+            tt_metal::SetRuntimeArgs(
+                zero_program,
+                kernel,
+                core,
+                {
+                    id,
+                    start_addr,
+                    end_addr,
+                });
+        }
+    }
+
+    workload.add_program(device_range, std::move(zero_program));
+    fixture->RunProgram(mesh_device, workload, true);
+    fixture->FinishCommands(mesh_device);
+
+    // log_info(tt::LogTest, "      done zeroing bank {}", dram_bank_id);
+}
+
+}  // namespace tt::tt_metal
+
+#endif /* _ETH_COMMON_HPP */
