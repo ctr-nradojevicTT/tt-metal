@@ -5,6 +5,7 @@
 #include "common_dram.hpp"
 #include "dram_utils.hpp"
 #include "timestamp.hpp"
+#include "args.hpp"
 
 // ============================================================
 // Error injection configuration
@@ -40,11 +41,11 @@
 
 static inline uint32_t dram_read_word_from_bank(
     uint32_t bank_id, uint64_t bank_offset_base, uint32_t byte_offset, uint32_t noc_id, uint32_t scratch_l1_addr) {
+    /* ======================== */
     const uint32_t aligned_offset = byte_offset & ~0x1Fu;  // 32B align
     const uint32_t word_index = (byte_offset & 0x1Fu) / sizeof(uint32_t);
 
-    uint64_t dram_noc_addr =
-        get_noc_addr_from_bank_id<true>(bank_id, (uint32_t)(bank_offset_base + (uint64_t)aligned_offset), noc_id);
+    uint64_t dram_noc_addr = get_noc_addr_from_bank_id<true>(bank_id, bank_offset_base + aligned_offset, noc_id);
 
     noc_async_read(dram_noc_addr, scratch_l1_addr, 32);
     noc_async_read_barrier();
@@ -55,7 +56,7 @@ static inline uint32_t dram_read_word_from_bank(
 
 static inline bool dram_should_inject_write_error(uint32_t global_word_index) {
 #if INSERT_WRITE_ERRORS
-    for (uint32_t n = 0; n < WRITE_ERROR_COUNT; ++n) {
+    for (uint32_t n = 0; n < WRITE_ERROR_COUNT; n++) {
         const uint32_t target = WRITE_ERROR_START_WORD + n * WRITE_ERROR_STRIDE_WORDS;
         if (global_word_index == target) {
             return true;
@@ -67,7 +68,7 @@ static inline bool dram_should_inject_write_error(uint32_t global_word_index) {
 
 static inline bool dram_should_inject_read_error(uint32_t global_word_index) {
 #if INSERT_READ_ERRORS
-    for (uint32_t n = 0; n < READ_ERROR_COUNT; ++n) {
+    for (uint32_t n = 0; n < READ_ERROR_COUNT; n++) {
         const uint32_t target = READ_ERROR_START_WORD + n * READ_ERROR_STRIDE_WORDS;
         if (global_word_index == target) {
             return true;
@@ -84,6 +85,7 @@ static inline bool dram_should_inject_read_error(uint32_t global_word_index) {
     uint32_t transfer_bytes,
     uint32_t* expect_words,
     uint32_t* observe_words) {
+    /* ======================== */
     if (p.pattern_id != DRAM_PATTERN_CHECKERBOARD) {
         return;
     }
@@ -98,29 +100,29 @@ static inline bool dram_should_inject_read_error(uint32_t global_word_index) {
     }
 
     constexpr uint64_t dump_size_bytes = 2048ull;
-    constexpr uint64_t target_end = (uint64_t)DRAM_TEST_MAX_BANK_BYTES;
+    constexpr uint64_t target_end = DRAM_TEST_MAX_BANK_BYTES;
     constexpr uint64_t target_start = target_end - dump_size_bytes;
 
-    const uint64_t chunk_start = bank_offset_base + (uint64_t)offset;
-    const uint64_t chunk_end = chunk_start + (uint64_t)transfer_bytes;
+    const uint64_t chunk_start = bank_offset_base + offset;
+    const uint64_t chunk_end = chunk_start + transfer_bytes;
 
     if (chunk_end <= target_start || chunk_start >= target_end) {
         return;
     }
 
-    const uint64_t dump_from = (chunk_start < target_start) ? target_start : chunk_start;
-    const uint64_t dump_to = (chunk_end > target_end) ? target_end : chunk_end;
+    const uint64_t dump_from = chunk_start < target_start ? target_start : chunk_start;
+    const uint64_t dump_to = chunk_end > target_end ? target_end : chunk_end;
 
-    const uint32_t first_word = (uint32_t)((dump_from - chunk_start) / sizeof(uint32_t));
-    const uint32_t last_word = (uint32_t)((dump_to - chunk_start) / sizeof(uint32_t));
+    const uint32_t first_word = (dump_from - chunk_start) / sizeof(uint32_t);
+    const uint32_t last_word = (dump_to - chunk_start) / sizeof(uint32_t);
 
     DPRINT << "=== DRAM top 2KB dump begin ===" << ENDL();
     DPRINT << "bank=" << p.bank_id << " pass=" << p.pass_index << " repeat=" << p.repeat_index << " chunk_start=0x"
            << HEX() << chunk_start << " chunk_end=0x" << chunk_end << " dump_from=0x" << dump_from << " dump_to=0x"
            << dump_to << ENDL();
 
-    for (uint32_t i = first_word; i < last_word; ++i) {
-        const uint64_t abs_addr = chunk_start + (uint64_t)i * sizeof(uint32_t);
+    for (uint32_t i = first_word; i < last_word; i++) {
+        const uint64_t abs_addr = chunk_start + i * sizeof(uint32_t);
         DPRINT << "addr=0x" << HEX() << abs_addr << " expected=0x" << expect_words[i] << " observed=0x"
                << observe_words[i] << ENDL();
     }
@@ -133,11 +135,13 @@ static inline void dram_status_heartbeat(volatile CoreProgressStatus* status, ui
     status->heartbeat_tick++;
 }
 
-static inline bool dram_stop_requested(volatile DramJobQueueCtrl* ctrl) { return ctrl->stop_requested != 0u; }
+static inline bool dram_stop_requested(volatile DramJobQueueCtrl* ctrl) { return ctrl->stop_requested; }
 
 static inline DramTestParameters dram_make_params_from_work_item(
     const volatile DramWorkItem& job, uint32_t result_l1_addr, uint32_t expect_l1_addr, uint32_t observe_l1_addr) {
+    /* ======================== */
     DramTestParameters p{};
+
     p.bank_id = job.bank_id;
     p.bank_offset_lo = job.bank_offset_lo;
     p.bank_offset_hi = job.bank_offset_hi;
@@ -180,7 +184,7 @@ static inline void dram_reset_result(volatile DramBaseResult* result, const Dram
     result->write_ticks = 0u;
     result->read_ticks = 0u;
 
-    for (uint32_t i = 0; i < 5u; ++i) {
+    for (uint32_t i = 0; i < 5u; i++) {
         result->readback_data[i] = 0u;
     }
 }
@@ -194,6 +198,7 @@ static inline bool run_one_dram_job(
     uint32_t* observe_words,
     volatile CoreProgressStatus* status,
     volatile DramJobQueueCtrl* ctrl) {
+    /* ======================== */
     const uint64_t bank_offset_base = dram_test_bank_offset(p);
 
     dram_reset_result(result, p);
@@ -203,7 +208,7 @@ static inline bool run_one_dram_job(
         return false;
     }
 
-    if ((p.chunk_bytes == 0u) || ((p.chunk_bytes & 0x3u) != 0u) || ((p.total_bytes & 0x3u) != 0u)) {
+    if (!p.chunk_bytes || (p.chunk_bytes & 0x3u) || (p.total_bytes & 0x3u)) {
         result->failures = 1u;
         result->first_fail_addr = 0u;
         result->first_expected = 0u;
@@ -267,7 +272,7 @@ static inline bool run_one_dram_job(
                 const uint32_t value = dram_pattern_marching_zero_bits(p.pass_index);
                 dram_pattern_constant_fill_buffer(expect_words, word_count, value);
             } else {
-                for (uint32_t i = 0; i < word_count; ++i) {
+                for (uint32_t i = 0; i < word_count; i++) {
                     if (p.pattern_id == DRAM_PATTERN_RANDOM) {
                         rng_state = dram_pattern_random_step(rng_state);
                         expect_words[i] = rng_state;
@@ -279,29 +284,26 @@ static inline bool run_one_dram_job(
                     }
                 }
             }
-            uint64_t t1 = timestamp();
-            total_prepare_ticks += (t1 - t0);
+            total_prepare_ticks += timestamp() - t0;
         }
 
         if (!p.skip_writes) {
             dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_WRITE);
 
-            uint64_t write_dram_noc_addr = get_noc_addr_from_bank_id<true>(
-                p.bank_id, (uint32_t)(bank_offset_base + (uint64_t)offset), p.write_noc);
+            uint64_t write_dram_noc_addr =
+                get_noc_addr_from_bank_id<true>(p.bank_id, bank_offset_base + offset, p.write_noc);
 
             uint64_t t0 = timestamp();
             noc_async_write(p.expect_l1_addr, write_dram_noc_addr, transfer_bytes);
             noc_async_write_barrier();
 
 #if INSERT_WRITE_ERRORS
-            for (uint32_t i = 0; i < word_count; ++i) {
+            for (uint32_t i = 0; i < word_count; i++) {
                 const uint32_t global_word_index = base_word_index + i;
                 if (dram_should_inject_write_error(global_word_index)) {
                     uint32_t wrong_word = expect_words[i] ^ 0x00000001u;
                     uint64_t word_dram_noc_addr = get_noc_addr_from_bank_id<true>(
-                        p.bank_id,
-                        (uint32_t)(bank_offset_base + (uint64_t)offset + (uint64_t)i * sizeof(uint32_t)),
-                        p.write_noc);
+                        p.bank_id, bank_offset_base + offset + i * sizeof(uint32_t), p.write_noc);
                     uint32_t* inject_word_ptr = (uint32_t*)p.observe_l1_addr;
                     inject_word_ptr[0] = wrong_word;
                     noc_async_write(p.observe_l1_addr, word_dram_noc_addr, sizeof(uint32_t));
@@ -317,7 +319,7 @@ static inline bool run_one_dram_job(
             dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_READ);
 
             uint64_t read_dram_noc_addr =
-                get_noc_addr_from_bank_id<true>(p.bank_id, (uint32_t)(bank_offset_base + (uint64_t)offset), p.read_noc);
+                get_noc_addr_from_bank_id<true>(p.bank_id, bank_offset_base + offset, p.read_noc);
 
             uint64_t t0 = timestamp();
             noc_async_read(read_dram_noc_addr, p.observe_l1_addr, transfer_bytes);
@@ -330,8 +332,8 @@ static inline bool run_one_dram_job(
 
             dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_VERIFY);
 
-            for (uint32_t i = 0; i < word_count; ++i) {
-                if ((i & 0x3FFu) == 0u && dram_stop_requested(ctrl)) {
+            for (uint32_t i = 0; i < word_count; i++) {
+                if (!(i & 0x3FFu) && dram_stop_requested(ctrl)) {
                     status->current_stage = DRAM_PROGRESS_STAGE_DONE;
                     return false;
                 }
@@ -384,7 +386,7 @@ static inline bool run_one_dram_job(
                         result->suspected_read_failures++;
                     }
 
-                    if (result->failures == 0u) {
+                    if (!result->failures) {
                         result->first_fail_addr = fail_byte_offset;
                         result->first_expected = expected;
                         result->first_observed = observed;
@@ -434,15 +436,18 @@ static inline bool run_one_dram_job(
     return true;
 }
 
+#define ARGS(X)                      \
+    X(uint32_t, queue_ctrl_l1_addr)  \
+    X(uint32_t, queue_jobs_l1_addr)  \
+    X(uint32_t, status_l1_addr)      \
+    X(uint32_t, result_ring_l1_addr) \
+    X(uint32_t, expect_l1_addr)      \
+    X(uint32_t, observe_l1_addr)     \
+    X(uint32_t, queue_capacity)      \
+    X(uint32_t, wake_flag_l1_addr)
+
 void kernel_main() {
-    const uint32_t queue_ctrl_l1_addr = get_arg_val<uint32_t>(0);
-    const uint32_t queue_jobs_l1_addr = get_arg_val<uint32_t>(1);
-    const uint32_t status_l1_addr = get_arg_val<uint32_t>(2);
-    const uint32_t result_ring_l1_addr = get_arg_val<uint32_t>(3);
-    const uint32_t expect_l1_addr = get_arg_val<uint32_t>(4);
-    const uint32_t observe_l1_addr = get_arg_val<uint32_t>(5);
-    const uint32_t queue_capacity = get_arg_val<uint32_t>(6);
-    const uint32_t wake_flag_l1_addr = get_arg_val<uint32_t>(7);
+    ARG_RUNTIME_INIT(ARGS);
 
     volatile DramJobQueueCtrl* ctrl = (volatile DramJobQueueCtrl*)queue_ctrl_l1_addr;
     volatile DramWorkItem* jobs = (volatile DramWorkItem*)queue_jobs_l1_addr;
@@ -510,7 +515,7 @@ void kernel_main() {
         status->state = DRAM_PROGRESS_STATE_IDLE;
         dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_WAIT);
 
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < 64; i++) {
             noc_async_read_barrier();
 
             if (ctrl->head != ctrl->tail || ctrl->stop_requested) {

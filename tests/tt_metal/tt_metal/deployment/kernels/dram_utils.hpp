@@ -10,9 +10,9 @@ static_assert(NOC_WORD_BYTES == DRAM_TEST_NOC_WORD_BYTES, "NOC word size mismatc
 static_assert(MEM_DRAM_SIZE == DRAM_TEST_MAX_BANK_BYTES, "DRAM size mismatch");
 
 static inline uint32_t dram_xorshift32_step(uint32_t& state) {
-    state ^= (state << 13);
-    state ^= (state >> 17);
-    state ^= (state << 5);
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
     return state;
 }
 

@@ -94,7 +94,7 @@ struct DramTestParameters {
 };
 
 static inline uint64_t dram_test_bank_offset(const DramTestParameters& p) {
-    return ((uint64_t)p.bank_offset_hi << 32) | (uint64_t)p.bank_offset_lo;
+    return ((uint64_t)p.bank_offset_hi << 32) | p.bank_offset_lo;
 }
 
 // -------------------------

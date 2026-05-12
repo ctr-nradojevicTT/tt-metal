@@ -59,9 +59,9 @@ struct DramXoshiro128ppState {
 };
 
 static inline uint32_t dram_pattern_random_step(uint32_t value) {
-    value ^= (value << 13);
-    value ^= (value >> 17);
-    value ^= (value << 5);
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
     return value;
 }
 
@@ -103,7 +103,7 @@ static inline uint32_t dram_pattern_random(uint32_t seed, uint32_t pass, uint32_
         rng_state = 1u;
     }
 
-    for (uint32_t i = 0; i <= word_index; ++i) {
+    for (uint32_t i = 0; i <= word_index; i++) {
         rng_state = dram_pattern_random_step(rng_state);
     }
 
@@ -116,8 +116,7 @@ static inline uint32_t dram_pattern_marching_ones(uint32_t pass, uint32_t word_i
 }
 
 static inline uint32_t dram_pattern_marching_zeroes(uint32_t pass, uint32_t word_index) {
-    uint32_t shift = (pass + word_index) & 31u;
-    return ~(1u << shift);
+    return ~dram_pattern_marching_ones(pass, word_index);
 }
 
 static inline uint32_t dram_pattern_reversible_random(uint32_t word_index) {
@@ -130,7 +129,7 @@ static inline uint32_t dram_pattern_reversible_random(uint32_t word_index) {
     uint32_t v1 = 0u;
     uint32_t sum = 0u;
 
-    for (uint32_t i = 0; i < 32u; ++i) {
+    for (uint32_t i = 0; i < 32u; i++) {
         sum += delta;
         v += ((v1 << 4) + k0) ^ (v1 + sum) ^ ((v1 >> 5) + k1);
         v1 += ((v << 4) + k2) ^ (v + sum) ^ ((v >> 5) + k3);
@@ -166,12 +165,10 @@ static inline uint32_t dram_pattern_saturation(uint32_t pass, uint32_t word_inde
 }
 
 static inline uint32_t dram_pattern_marching_one_bits(uint32_t pass) {
-    return (pass == 32u) ? 0xFFFFFFFFu : ((1u << pass) - 1u);
+    return pass == 32u ? 0xFFFFFFFFu : (1u << pass) - 1u;
 }
 
-static inline uint32_t dram_pattern_marching_zero_bits(uint32_t pass) {
-    return ~((pass == 32u) ? 0xFFFFFFFFu : ((1u << pass) - 1u));
-}
+static inline uint32_t dram_pattern_marching_zero_bits(uint32_t pass) { return ~dram_pattern_marching_one_bits(pass); }
 
 static inline uint32_t dram_pattern_counter(uint32_t seed, uint32_t word_index) { return seed + word_index; }
 
@@ -186,7 +183,7 @@ static inline uint32_t dram_pattern_bytewise_ssn(uint32_t repeat_index, uint32_t
     }
 
     uint32_t value = 0u;
-    for (uint32_t i = 0; i < 4u; ++i) {
+    for (uint32_t i = 0; i < 4u; i++) {
         value = (value << 8) | byte_val;
     }
 
@@ -212,7 +209,7 @@ static inline void dram_pattern_checkerboard_fill_buffer(uint32_t* dst_words, ui
 static inline void dram_pattern_counter_fill_buffer(
     uint32_t* dst_words, uint32_t word_count, uint32_t seed, uint32_t base_word_index) {
     uint32_t value = seed + base_word_index;
-    for (uint32_t i = 0; i < word_count; ++i) {
+    for (uint32_t i = 0; i < word_count; i++) {
         dst_words[i] = value++;
     }
 }
@@ -220,13 +217,13 @@ static inline void dram_pattern_counter_fill_buffer(
 static inline void dram_pattern_address_fill_buffer(
     uint32_t* dst_words, uint32_t word_count, uint32_t repeat_index, uint32_t base_word_index) {
     uint32_t value = base_word_index | (repeat_index << 29);
-    for (uint32_t i = 0; i < word_count; ++i) {
+    for (uint32_t i = 0; i < word_count; i++) {
         dst_words[i] = value++;
     }
 }
 
 static inline void dram_pattern_constant_fill_buffer(uint32_t* dst_words, uint32_t word_count, uint32_t value) {
-    for (uint32_t i = 0; i < word_count; ++i) {
+    for (uint32_t i = 0; i < word_count; i++) {
         dst_words[i] = value;
     }
 }
@@ -235,37 +232,25 @@ static inline uint32_t dram_pattern_generate(
     uint32_t pattern_id, uint32_t seed, uint32_t pass, uint32_t word_index, uint32_t repeat_index) {
     switch (pattern_id) {
         case DRAM_PATTERN_CHECKERBOARD: return dram_pattern_checkerboard(pass, word_index);
-
         case DRAM_PATTERN_RANDOM: return dram_pattern_random(seed, pass, word_index);
-
         case DRAM_PATTERN_MARCHING_ONES: return dram_pattern_marching_ones(pass, word_index);
-
         case DRAM_PATTERN_MARCHING_ZEROES: return dram_pattern_marching_zeroes(pass, word_index);
-
         case DRAM_PATTERN_REVERSIBLE_RANDOM: return dram_pattern_reversible_random(word_index);
-
         case DRAM_PATTERN_RANDOM_XOSHIRO128PP: {
             DramXoshiro128ppState state = dram_pattern_random_xoshiro128pp_init(seed ^ pass);
-            for (uint32_t i = 0; i < word_index; ++i) {
+            for (uint32_t i = 0; i < word_index; i++) {
                 (void)dram_pattern_random_xoshiro128pp_next(state);
             }
             return dram_pattern_random_xoshiro128pp_next(state);
         }
 
         case DRAM_PATTERN_TOGGLE_BITS: return dram_pattern_toggle_bits(pass, word_index);
-
         case DRAM_PATTERN_SATURATION: return dram_pattern_saturation(pass, word_index);
-
         case DRAM_PATTERN_MARCHING_ONE_BITS: return dram_pattern_marching_one_bits(pass);
-
         case DRAM_PATTERN_MARCHING_ZERO_BITS: return dram_pattern_marching_zero_bits(pass);
-
         case DRAM_PATTERN_COUNTER: return dram_pattern_counter(seed, word_index);
-
         case DRAM_PATTERN_ADDRESS: return dram_pattern_address(repeat_index, word_index);
-
         case DRAM_PATTERN_BYTEWISE_SSN: return dram_pattern_bytewise_ssn(repeat_index, word_index);
-
         default: return 0u;
     }
 }
