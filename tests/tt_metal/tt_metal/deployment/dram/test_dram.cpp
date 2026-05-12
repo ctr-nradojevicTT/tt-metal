@@ -820,6 +820,260 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequent
     ASSERT_TRUE(all_pass);
 }
 
+TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBanksParallel) {
+    if (g_stop_requested.load()) {
+        GTEST_SKIP() << "Test interrupted by user.";
+    }
+    g_stop_message_printed.store(false);
+    g_watchdog_requested.store(false);
+
+    bool all_pass = true;
+    DramGalaxySummary galaxy{};
+    const auto galaxy_start = std::chrono::steady_clock::now();
+
+    constexpr uint64_t controller_bank_offset = 0u;
+    constexpr uint32_t repeats = 1u;
+    constexpr uint32_t initial_seed = 0x12345678u;
+    constexpr uint32_t advance_seed = 1u;
+
+    static const uint32_t kDeploymentPatterns[] = {
+        DRAM_PATTERN_COUNTER,
+        DRAM_PATTERN_CHECKERBOARD,
+        DRAM_PATTERN_ADDRESS,
+        DRAM_PATTERN_MARCHING_ONES,
+        DRAM_PATTERN_MARCHING_ZEROES,
+        DRAM_PATTERN_MARCHING_ONE_BITS,
+        DRAM_PATTERN_MARCHING_ZERO_BITS,
+        DRAM_PATTERN_TOGGLE_BITS,
+        DRAM_PATTERN_SATURATION,
+        DRAM_PATTERN_REVERSIBLE_RANDOM,
+        DRAM_PATTERN_RANDOM,
+        DRAM_PATTERN_RANDOM_XOSHIRO128PP,
+        DRAM_PATTERN_BYTEWISE_SSN,
+    };
+
+    const uint32_t chunk_bytes = get_dram_chunk_bytes_from_env(4096u);
+    const uint32_t total_bytes_per_controller = get_dram_test_bytes_from_env(DRAM_TEST_BYTES);
+
+    auto noc_mode = get_dram_noc_mode_from_env();
+
+    std::signal(SIGINT, handle_sigint);
+
+    log_info(tt::LogTest, "Persistent partitioned-workers all-DRAM test running on {} chip(s)", devices_.size());
+
+    for (size_t chip_index = 0; chip_index < devices_.size(); chip_index++) {
+        if (g_stop_requested.load()) {
+            break;
+        }
+
+        const auto& mesh_device = devices_[chip_index];
+        auto* const device = mesh_device->get_devices()[0];
+        galaxy.chips_tested++;
+
+        log_info(tt::LogTest, "Starting chip {}/{} device_id={}", chip_index + 1, devices_.size(), device->id());
+
+        const uint32_t num_dram_channels = device->num_dram_channels();
+        const auto worker_cores = get_worker_cores_for_deployment(device);
+
+        TT_FATAL(!worker_cores.empty(), "No worker cores found");
+        TT_FATAL(num_dram_channels > 0, "No DRAM channels found");
+        TT_FATAL(
+            worker_cores.size() >= num_dram_channels,
+            "Need at least one worker per DRAM channel: workers={} dram_channels={}",
+            worker_cores.size(),
+            num_dram_channels);
+
+        log_info(
+            tt::LogTest,
+            "device_id={} persistent partitioned-workers all-DRAM test: workers={} dram_channels={} bytes_per_dram={} "
+            "chunk_bytes={}",
+            device->id(),
+            worker_cores.size(),
+            num_dram_channels,
+            total_bytes_per_controller,
+            chunk_bytes);
+
+        std::vector<std::vector<size_t>> workers_for_bank(num_dram_channels);
+
+        for (size_t worker_idx = 0; worker_idx < worker_cores.size(); worker_idx++) {
+            const uint32_t bank_id = worker_idx % num_dram_channels;
+
+            workers_for_bank[bank_id].push_back(worker_idx);
+        }
+
+        for (uint32_t bank_id = 0; bank_id < num_dram_channels; bank_id++) {
+            log_info(
+                tt::LogTest,
+                "device_id={} DRAM bank {} assigned {} worker cores",
+                device->id(),
+                bank_id,
+                workers_for_bank[bank_id].size());
+        }
+
+        std::vector<std::vector<DramWorkItem>> jobs_per_core(worker_cores.size());
+
+        uint32_t job_id = 1u;
+        uint32_t seed = initial_seed;
+        uint64_t pattern_toggle_index = 0;
+
+        for (uint32_t repeat_index = 0; repeat_index < repeats; repeat_index++) {
+            for (uint32_t pattern_id : kDeploymentPatterns) {
+                if (g_stop_requested.load()) {
+                    break;
+                }
+
+                const uint32_t write_noc = resolve_noc(noc_mode, pattern_toggle_index);
+
+                const uint32_t read_noc = resolve_noc(noc_mode, pattern_toggle_index + 1);
+
+                const uint32_t num_passes = num_passes_for_pattern(pattern_id);
+
+                for (uint32_t pass_index = 0; pass_index < num_passes; pass_index++) {
+                    for (uint32_t bank_id = 0; bank_id < num_dram_channels; bank_id++) {
+                        const auto& bank_workers = workers_for_bank[bank_id];
+
+                        TT_FATAL(!bank_workers.empty(), "No workers assigned to DRAM bank {}", bank_id);
+
+                        const uint64_t bytes_per_core_base =
+                            (total_bytes_per_controller / bank_workers.size()) & ~0xFFFULL;
+
+                        TT_FATAL(
+                            bytes_per_core_base >= chunk_bytes,
+                            "bytes_per_core_base too small: {} < chunk_bytes {}",
+                            bytes_per_core_base,
+                            chunk_bytes);
+
+                        TT_FATAL(
+                            bytes_per_core_base <= std::numeric_limits<uint32_t>::max(),
+                            "bytes_per_core_base must fit uint32_t");
+
+                        const uint64_t covered_bytes = bytes_per_core_base * bank_workers.size();
+
+                        const uint64_t remainder_bytes = total_bytes_per_controller - covered_bytes;
+
+                        TT_FATAL((remainder_bytes & 0xFFFULL) == 0ULL, "remainder_bytes must stay 4KB aligned");
+
+                        for (size_t local_idx = 0; local_idx < bank_workers.size(); local_idx++) {
+                            const size_t worker_idx = bank_workers[local_idx];
+
+                            const uint64_t bank_offset = controller_bank_offset + local_idx * bytes_per_core_base;
+
+                            uint64_t bytes_this_core = bytes_per_core_base;
+
+                            if (local_idx == bank_workers.size() - 1) {
+                                bytes_this_core += remainder_bytes;
+                            }
+
+                            TT_FATAL(
+                                bytes_this_core >= chunk_bytes,
+                                "bytes_this_core too small: {} < chunk_bytes {}",
+                                bytes_this_core,
+                                chunk_bytes);
+
+                            TT_FATAL(
+                                bytes_this_core <= std::numeric_limits<uint32_t>::max(),
+                                "bytes_this_core must fit uint32_t");
+
+                            DramWorkItem job{};
+
+                            job.job_id = job_id++;
+                            job.bank_id = bank_id;
+                            job.bank_offset_lo = bank_offset & 0xFFFFFFFFull;
+                            job.bank_offset_hi = (bank_offset >> 32) & 0xFFFFFFFFull;
+                            job.total_bytes = bytes_this_core;
+                            job.chunk_bytes = chunk_bytes;
+                            job.pattern_id = pattern_id;
+                            job.seed = seed;
+                            job.pass_index = pass_index;
+                            job.repeat_index = repeat_index;
+                            job.write_noc = write_noc;
+                            job.read_noc = read_noc;
+                            job.max_burst_len = chunk_bytes;
+                            job.transfer_len_mode = 0u;
+                            job.skip_writes = 0u;
+                            job.skip_reads = 0u;
+
+                            jobs_per_core[worker_idx].push_back(job);
+                        }
+                    }
+                }
+
+                pattern_toggle_index++;
+            }
+
+            seed += advance_seed;
+        }
+
+        const uint64_t total_jobs_for_chip = job_id - 1u;
+
+        const auto start = std::chrono::steady_clock::now();
+
+        DramMultiInstanceSummary run = run_dram_persistent_jobs_test_verbose_parallel(
+            static_cast<MeshDispatchFixture*>(this),
+            mesh_device,
+            worker_cores,
+            jobs_per_core,
+            chunk_bytes,
+            DataMovementProcessor::RISCV_0);
+
+        const auto end = std::chrono::steady_clock::now();
+
+        const auto duration_sec = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
+
+        accumulate_galaxy_summary(galaxy, run, total_jobs_for_chip);
+
+        const auto& s = run.summary;
+
+        log_info(tt::LogTest, "=== Persistent Partitioned Workers All-DRAM Chip Summary ===");
+
+        if (g_watchdog_requested.load()) {
+            log_info(tt::LogTest, "device_id={} status=ABORTED reason=stall_watchdog", device->id());
+        }
+
+        log_info(
+            tt::LogTest,
+            "device_id={} workers={} dram_channels={} jobs={} duration={} checked_bytes={} pass={}",
+            device->id(),
+            worker_cores.size(),
+            num_dram_channels,
+            total_jobs_for_chip,
+            format_duration_seconds(duration_sec),
+            s.checked_bytes,
+            s.pass ? "YES" : "NO");
+
+        if (s.pass) {
+            log_info(tt::LogTest, "device_id={} all jobs passed with no errors", device->id());
+        }
+
+        if (!s.pass) {
+            all_pass = false;
+        }
+
+        if (g_watchdog_requested.load()) {
+            all_pass = false;
+            break;
+        }
+    }
+
+    const auto galaxy_end = std::chrono::steady_clock::now();
+    log_galaxy_summary(
+        "Persistent Partitioned Workers All-DRAM",
+        galaxy,
+        std::chrono::duration_cast<std::chrono::seconds>(galaxy_end - galaxy_start));
+
+    all_pass &= galaxy.pass;
+
+    if (g_watchdog_requested.load()) {
+        FAIL() << "Test aborted by stall watchdog.";
+    }
+
+    if (g_stop_requested.load()) {
+        GTEST_SKIP() << "Test interrupted by user.";
+    }
+
+    ASSERT_TRUE(all_pass);
+}
+
 TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBanks) {
     if (g_stop_requested.load()) {
         GTEST_SKIP() << "Test interrupted by user.";
